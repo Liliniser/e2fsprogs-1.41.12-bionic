@@ -29,7 +29,11 @@
 
 #include <sys/types.h>
 #include <sys/wait.h>
+#if ANDROID
+#include <signal.h>
+#else
 #include <sys/signal.h>
+#endif
 #include <sys/stat.h>
 #include <limits.h>
 #include <stdio.h>
@@ -39,9 +43,9 @@
 #if HAVE_STDLIB_H
 #include <stdlib.h>
 #endif
-#if HAVE_ERRNO_H
+/*#if HAVE_ERRNO_H
 #include <errno.h>
-#endif
+#endif*/
 #if HAVE_PATHS_H
 #include <paths.h>
 #endif
@@ -51,7 +55,7 @@
 #if HAVE_ERRNO_H
 #include <errno.h>
 #endif
-#if HAVE_MALLOC_H
+#ifdef HAVE_MALLOC_H
 #include <malloc.h>
 #endif
 #ifdef HAVE_SIGNAL_H

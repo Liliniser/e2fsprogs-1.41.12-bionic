@@ -58,7 +58,9 @@ int fsetversion (const char * name, unsigned long version)
    return syscall(SYS_fsctl, name, EXT2_IOC_SETVERSION, &ver, 0);
 #endif
 #else /* ! HAVE_EXT2_IOCTLS */
+#ifndef errno
 	extern int errno;
+#endif
 	errno = EOPNOTSUPP;
 	return -1;
 #endif /* ! HAVE_EXT2_IOCTLS */

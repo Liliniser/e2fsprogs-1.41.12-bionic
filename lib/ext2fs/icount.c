@@ -31,14 +31,14 @@
  * Also, e2fsck tends to load the icount data sequentially.
  *
  * So, we use an inode bitmap to indicate which inodes have a count of
- * one, and then use a sorted list to store the counts for inodes
+ * one, and then use a sorted tree to store the counts for inodes
  * which are greater than one.
  *
  * We also use an optional bitmap to indicate which inodes are already
- * in the sorted list, to speed up the use of this abstraction by
+ * in the sorted tree, to speed up the use of this abstraction by
  * e2fsck's pass 2.  Pass 2 increments inode counts as it finds them,
- * so this extra bitmap avoids searching the sorted list to see if a
- * particular inode is on the sorted list already.
+ * so this extra bitmap avoids searching the sorted tree to see if a
+ * particular inode is on the sorted tree already.
  */
 
 struct ext2_icount_el {
@@ -54,7 +54,7 @@ struct ext2_icount {
 	ext2_ino_t		size;
 	ext2_ino_t		num_inodes;
 	ext2_ino_t		cursor;
-	struct ext2_icount_el	*list;
+	struct ext2_icount_el	**tree;
 	struct ext2_icount_el	*last_lookup;
 	char			*tdb_fn;
 	TDB_CONTEXT		*tdb;
@@ -69,14 +69,82 @@ struct ext2_icount {
  */
 #define icount_16_xlate(x) (((x) > 65500) ? 65500 : (x))
 
+/*
+ * Number of elements in one icount group. This should be a power of two
+ * so that modulo operations are fast.
+ */
+#define ICOUNT_FANOUT (65536 / sizeof(struct ext2_icount_el))
+
+static inline ext2_ino_t num_icount_groups(ext2_icount_t icount)
+{
+	return (icount->size + ICOUNT_FANOUT - 1) / ICOUNT_FANOUT;
+}
+
+static inline void get_icount_indices(ext2_ino_t num, ext2_ino_t *group_num,
+				      ext2_ino_t *group_index)
+{
+	*group_num = num / ICOUNT_FANOUT;
+	*group_index = num % ICOUNT_FANOUT;
+}
+
+static inline struct ext2_icount_el *get_icount_entry(ext2_icount_t icount,
+						      ext2_ino_t num)
+{
+	ext2_ino_t gnum, gidx;
+
+	get_icount_indices(num, &gnum, &gidx);
+	return icount->tree[gnum] + gidx;
+}
+
+static inline ext2_ino_t get_icount_ino(ext2_icount_t icount, ext2_ino_t num)
+{
+	struct ext2_icount_el *el = get_icount_entry(icount, num);
+
+	return el->ino;
+}
+
+static inline void set_icount_ino(ext2_icount_t icount, ext2_ino_t num,
+				  ext2_ino_t ino)
+{
+	struct ext2_icount_el *el = get_icount_entry(icount, num);
+
+	el->ino = ino;
+}
+
+static inline struct ext2_icount_el *set_icount_entry(ext2_icount_t icount,
+						      ext2_ino_t num,
+						      ext2_ino_t ino,
+						      __u32 count)
+{
+	struct ext2_icount_el *el = get_icount_entry(icount, num);
+
+	el->ino = ino;
+	el->count = count;
+	return el;
+}
+
+static inline errcode_t alloc_icount_group(struct ext2_icount_el **ptr)
+{
+	errcode_t retval = ext2fs_get_array(ICOUNT_FANOUT,
+					    sizeof(struct ext2_icount_el), ptr);
+	if (retval)
+		return retval;
+	memset(*ptr, 0, ICOUNT_FANOUT * sizeof(struct ext2_icount_el));
+	return 0;
+}
+
 void ext2fs_free_icount(ext2_icount_t icount)
 {
 	if (!icount)
 		return;
 
 	icount->magic = 0;
-	if (icount->list)
-		ext2fs_free_mem(&icount->list);
+	if (icount->tree) {
+		ext2_ino_t i, num_groups = num_icount_groups(icount);
+		for (i = 0; i < num_groups; i++)
+			ext2fs_free_mem(&icount->tree[i]);
+		ext2fs_free_mem(&icount->tree);
+	}
 	if (icount->single)
 		ext2fs_free_inode_bitmap(icount->single);
 	if (icount->multiple)
@@ -214,8 +282,7 @@ errcode_t ext2fs_create_icount2(ext2_filsys fs, int flags, unsigned int size,
 {
 	ext2_icount_t	icount;
 	errcode_t	retval;
-	size_t		bytes;
-	ext2_ino_t	i;
+	ext2_ino_t	i, num_groups;
 
 	if (hint) {
 		EXT2_CHECK_MAGIC(hint, EXT2_ET_MAGIC_ICOUNT);
@@ -241,28 +308,37 @@ errcode_t ext2fs_create_icount2(ext2_filsys fs, int flags, unsigned int size,
 		icount->size += fs->super->s_inodes_count / 50;
 	}
 
-	bytes = (size_t) (icount->size * sizeof(struct ext2_icount_el));
-#if 0
-	printf("Icount allocated %u entries, %d bytes.\n",
-	       icount->size, bytes);
-#endif
-	retval = ext2fs_get_array(icount->size, sizeof(struct ext2_icount_el),
-			 &icount->list);
+	num_groups = num_icount_groups(icount);
+	/* always allocate full icount groups */
+	icount->size = num_groups * ICOUNT_FANOUT;
+	retval = ext2fs_get_array(num_groups, sizeof(struct ext2_icount_el *),
+				  &icount->tree);
+
 	if (retval)
 		goto errout;
-	memset(icount->list, 0, bytes);
+	memset(icount->tree, 0, num_groups * sizeof(struct ext2_icount_el *));
+	for (i = 0; i < num_groups; i++) {
+		retval = alloc_icount_group(icount->tree + i);
+		if (retval)
+			goto errout;
+	}
+#if 0
+	printf("Icount allocated %zu entries, %d groups\n",
+	       icount->size, num_groups);
+#endif
+
 
 	icount->count = 0;
 	icount->cursor = 0;
 
 	/*
-	 * Populate the sorted list with those entries which were
+	 * Populate the sorted tree with those entries which were
 	 * found in the hint icount (since those are ones which will
-	 * likely need to be in the sorted list this time around).
+	 * likely need to be in the sorted tree this time around).
 	 */
 	if (hint) {
-		for (i=0; i < hint->count; i++)
-			icount->list[i].ino = hint->list[i].ino;
+		for (i = 0; i < hint->count; i++)
+			set_icount_ino(icount, i, get_icount_ino(hint, i));
 		icount->count = hint->count;
 	}
 
@@ -282,59 +358,65 @@ errcode_t ext2fs_create_icount(ext2_filsys fs, int flags,
 }
 
 /*
- * insert_icount_el() --- Insert a new entry into the sorted list at a
+ * insert_icount_el() --- Insert a new entry into the sorted tree at a
  * 	specified position.
  */
 static struct ext2_icount_el *insert_icount_el(ext2_icount_t icount,
 					    ext2_ino_t ino, int pos)
 {
-	struct ext2_icount_el 	*el;
 	errcode_t		retval;
-	ext2_ino_t		new_size = 0;
-	int			num;
+	ext2_ino_t		num_groups = num_icount_groups(icount);
+	ext2_ino_t		i, gnum, gidx;
 
 	if (icount->last_lookup && icount->last_lookup->ino == ino)
 		return icount->last_lookup;
 
 	if (icount->count >= icount->size) {
-		if (icount->count) {
-			new_size = icount->list[(unsigned)icount->count-1].ino;
-			new_size = (ext2_ino_t) (icount->count *
-				((float) icount->num_inodes / new_size));
-		}
-		if (new_size < (icount->size + 100))
-			new_size = icount->size + 100;
-#if 0
-		printf("Reallocating icount %u entries...\n", new_size);
-#endif
-		retval = ext2fs_resize_mem((size_t) icount->size *
-					   sizeof(struct ext2_icount_el),
-					   (size_t) new_size *
-					   sizeof(struct ext2_icount_el),
-					   &icount->list);
+		retval = ext2fs_resize_mem(num_groups *
+					   sizeof(struct ext2_icount_el *),
+					   (num_groups + 1) *
+					   sizeof(struct ext2_icount_el *),
+					   &icount->tree);
 		if (retval)
-			return 0;
-		icount->size = new_size;
+			return NULL;
+		retval = alloc_icount_group(icount->tree + num_groups);
+		if (retval)
+			return NULL;
+		icount->size += ICOUNT_FANOUT;
+		num_groups++;
 	}
-	num = (int) icount->count - pos;
-	if (num < 0)
-		return 0;	/* should never happen */
-	if (num) {
-		memmove(&icount->list[pos+1], &icount->list[pos],
-			sizeof(struct ext2_icount_el) * num);
+	if ((ext2_ino_t)pos == icount->count) /* Just insert the new element */
+		goto success;
+	/* Shift entries by one. */
+	get_icount_indices(pos, &gnum, &gidx);
+	for (i = num_groups - 1; i != (ext2_ino_t)-1 && i >= gnum; i--) {
+		struct ext2_icount_el *g = icount->tree[i];
+		const size_t s = sizeof(struct ext2_icount_el);
+
+		/*
+		 * If g is not the last group, move the last element
+		 * of this group to the beginning of the next group.
+		 */
+		if (i < num_groups - 1)
+			icount->tree[i + 1][0] = g[ICOUNT_FANOUT - 1];
+
+		if (i > gnum) /* shift the whole group */
+			memmove(g + 1, g, (ICOUNT_FANOUT - 1) * s);
+		else if (gidx < ICOUNT_FANOUT - 1)
+			/* shift starts at entry gidx */
+			memmove(g + gidx + 1, g + gidx,
+				(ICOUNT_FANOUT - gidx - 1) * s);
 	}
+success:
+	icount->last_lookup = set_icount_entry(icount, pos, ino, 0);
 	icount->count++;
-	el = &icount->list[pos];
-	el->count = 0;
-	el->ino = ino;
-	icount->last_lookup = el;
-	return el;
+	return icount->last_lookup;
 }
 
 /*
  * get_icount_el() --- given an inode number, try to find icount
- * 	information in the sorted list.  If the create flag is set,
- * 	and we can't find an entry, create one in the sorted list.
+ * 	information in the sorted tree. If the create flag is set,
+ *      and we can't find an entry, create one in the sorted tree.
  */
 static struct ext2_icount_el *get_icount_el(ext2_icount_t icount,
 					    ext2_ino_t ino, int create)
@@ -343,11 +425,11 @@ static struct ext2_icount_el *get_icount_el(ext2_icount_t icount,
 	int	low, high, mid;
 	ext2_ino_t	lowval, highval;
 
-	if (!icount || !icount->list)
+	if (!icount || !icount->tree)
 		return 0;
 
 	if (create && ((icount->count == 0) ||
-		       (ino > icount->list[(unsigned)icount->count-1].ino))) {
+		       (ino > get_icount_ino(icount, icount->count - 1)))) {
 		return insert_icount_el(icount, ino, (unsigned) icount->count);
 	}
 	if (icount->count == 0)
@@ -355,8 +437,8 @@ static struct ext2_icount_el *get_icount_el(ext2_icount_t icount,
 
 	if (icount->cursor >= icount->count)
 		icount->cursor = 0;
-	if (ino == icount->list[icount->cursor].ino)
-		return &icount->list[icount->cursor++];
+	if (ino == get_icount_ino(icount, icount->cursor))
+		return get_icount_entry(icount, icount->cursor++);
 #if 0
 	printf("Non-cursor get_icount_el: %u\n", ino);
 #endif
@@ -370,8 +452,8 @@ static struct ext2_icount_el *get_icount_el(ext2_icount_t icount,
 			mid = low;
 		else {
 			/* Interpolate for efficiency */
-			lowval = icount->list[low].ino;
-			highval = icount->list[high].ino;
+			lowval = get_icount_ino(icount, low);
+			highval = get_icount_ino(icount, high);
 
 			if (ino < lowval)
 				range = 0;
@@ -388,11 +470,11 @@ static struct ext2_icount_el *get_icount_el(ext2_icount_t icount,
 			mid = low + ((int) (range * (high-low)));
 		}
 #endif
-		if (ino == icount->list[mid].ino) {
+		if (ino == get_icount_ino(icount, mid)) {
 			icount->cursor = mid+1;
-			return &icount->list[mid];
+			return get_icount_entry(icount, mid);
 		}
-		if (ino < icount->list[mid].ino)
+		if (ino < get_icount_ino(icount, mid))
 			high = mid-1;
 		else
 			low = mid+1;
@@ -480,10 +562,10 @@ errcode_t ext2fs_icount_validate(ext2_icount_t icount, FILE *out)
 		return EXT2_ET_INVALID_ARGUMENT;
 	}
 	for (i=1; i < icount->count; i++) {
-		if (icount->list[i-1].ino >= icount->list[i].ino) {
-			fprintf(out, "%s: list[%d].ino=%u, list[%d].ino=%u\n",
-				bad, i-1, icount->list[i-1].ino,
-				i, icount->list[i].ino);
+		if (get_icount_ino(icount, i-1) >= get_icount_ino(icount, i)) {
+			fprintf(out, "%s: tree[%d].ino=%u, tree[%d].ino=%u\n",
+				bad, i-1, get_icount_ino(icount, i - 1),
+				i, get_icount_ino(icount, i));
 			ret = EXT2_ET_INVALID_ARGUMENT;
 		}
 	}
@@ -525,7 +607,7 @@ errcode_t ext2fs_icount_increment(ext2_icount_t icount, ext2_ino_t ino,
 	if (ext2fs_test_inode_bitmap(icount->single, ino)) {
 		/*
 		 * If the existing count is 1, then we know there is
-		 * no entry in the list.
+		 * no entry in the tree.
 		 */
 		if (set_inode_count(icount, ino, 2))
 			return EXT2_ET_NO_MEMORY;
@@ -535,7 +617,7 @@ errcode_t ext2fs_icount_increment(ext2_icount_t icount, ext2_ino_t ino,
 		/*
 		 * The count is either zero or greater than 1; if the
 		 * inode is set in icount->multiple, then there should
-		 * be an entry in the list, so we need to fix it.
+		 * be an entry in the tree, so we need to fix it.
 		 */
 		if (ext2fs_test_inode_bitmap(icount->multiple, ino)) {
 			get_inode_count(icount, ino, &curr_value);
@@ -555,7 +637,7 @@ errcode_t ext2fs_icount_increment(ext2_icount_t icount, ext2_ino_t ino,
 	} else {
 		/*
 		 * The count is either zero or greater than 1; try to
-		 * find an entry in the list to determine which.
+		 * find an entry in the tree to determine which.
 		 */
 		get_inode_count(icount, ino, &curr_value);
 		curr_value++;

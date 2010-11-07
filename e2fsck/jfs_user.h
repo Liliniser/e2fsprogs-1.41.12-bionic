@@ -60,9 +60,9 @@ typedef struct {
 #define kfree(p) free(p)
 
 #define cond_resched()	do { } while (0)
-
+#ifndef ANDROID
 typedef unsigned int __be32;
-
+#endif
 #define __init
 
 /*

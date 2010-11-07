@@ -56,7 +56,7 @@ test_icount: store 20000 0
 test_icount: fetch 20000
 Count is 0
 test_icount: get_size
-Size of icount is: 5
+Size of icount is: 8192
 test_icount: decrement 2
 decrement: Invalid argument passed to ext2 library while calling ext2fs_icount_decrement
 test_icount: increment 2
@@ -145,7 +145,7 @@ Count is now 0
 test_icount: decrement 5
 decrement: Invalid argument passed to ext2 library while calling ext2fs_icount_decrement
 test_icount: get_size
-Size of icount is: 105
+Size of icount is: 8192
 test_icount: validate
 Icount structure successfully validated
 test_icount: store 10 10
@@ -188,6 +188,6 @@ test_icount: dump
 95: 95
 100: 100
 test_icount: get_size
-Size of icount is: 105
+Size of icount is: 8192
 test_icount: validate
 Icount structure successfully validated

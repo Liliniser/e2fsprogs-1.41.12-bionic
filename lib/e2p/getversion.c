@@ -32,7 +32,9 @@ int getversion (int fd, unsigned long * version)
 	*version = ver;
 	return 0;
 #else /* ! HAVE_EXT2_IOCTLS */
+#ifndef errno
 	extern int errno;
+#endif
 	errno = EOPNOTSUPP;
 	return -1;
 #endif /* ! HAVE_EXT2_IOCTLS */

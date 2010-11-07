@@ -60,7 +60,9 @@ int fgetversion (const char * name, unsigned long * version)
    return(err);
 #endif
 #else /* ! HAVE_EXT2_IOCTLS */
+#ifndef errno
 	extern int errno;
+#endif
 	errno = EOPNOTSUPP;
 	return -1;
 #endif /* ! HAVE_EXT2_IOCTLS */

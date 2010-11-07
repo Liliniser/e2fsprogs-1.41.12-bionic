@@ -95,6 +95,9 @@ static int get_terminal_width(void)
 #ifdef TIOCGSIZE
 	struct ttysize	t_win;
 #endif
+#if ANDROID /* android SDK has only the constant, not the struct (BUG) */
+#undef TIOCGWINSZ
+#endif
 #ifdef TIOCGWINSZ
 	struct winsize	w_win;
 #endif
